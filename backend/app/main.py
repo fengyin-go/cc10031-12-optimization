@@ -12,6 +12,7 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 from app.services import runtime_session, callback_hook
+from app.services.locator_workbench import locator_workbench
 
 app = FastAPI(title="RPA流程自动化中心", version="1.0.0")
 
@@ -136,6 +137,99 @@ def runtime_sessions() -> dict[str, object]:
     return {"count": len(sessions), "sessions": sessions}
 
 
+# ---- 定位工作台：缓存指纹 / 失效策略 / 执行记录 ----
+
+@app.get("/api/locator-workbench")
+def locator_workbench_panels(
+    module: str | None = Query(default=None),
+    page_model_id: int | None = Query(default=None),
+) -> dict[str, object]:
+    """定位工作台：按页面模型查看缓存指纹、失效策略和最近执行记录。
+
+    Args:
+        module: 兼容旧调用的页面模型 ID 写法（``page_model`` 表示不过滤）。
+        page_model_id: 显式页面模型过滤。
+    """
+    model_id = page_model_id
+    if model_id is None:
+        model_id = _as_int(module)
+    return locator_workbench.snapshot(model_id)
+
+
+@app.get("/api/locator-workbench/window")
+def locator_workbench_window(
+    page_model_id: int = Query(..., ge=1),
+    window: int = Query(default=50, ge=1, le=500),
+) -> dict[str, object]:
+    """重算窗口内定位策略执行历史，解析当前可复用选择器边界。"""
+    return locator_workbench.recompute_window(page_model_id, window=window)
+
+
+@app.post("/api/locator-workbench/work-item")
+def locator_workbench_work_item(payload: dict | None = None) -> dict[str, object]:
+    """接收处理项并展开其承载的定位策略执行记录。
+
+    默认只展开（按处理项约定数据集），``execute=true`` 时继续执行。
+    """
+    body = payload or {}
+    work_item = body.get("work_item") if "work_item" in body else body
+    if not isinstance(work_item, dict):
+        return {"ok": False, "message": "处理项格式不正确"}
+    policy = str(body.get("policy") or "force_rebuild")
+    if body.get("execute"):
+        result = locator_workbench.execute_work_item(work_item, policy=policy)
+        return {"ok": True, **result}
+    expanded = locator_workbench.expand_work_item(work_item)
+    return {"ok": True, **expanded}
+
+
+@app.get("/api/locator-executions")
+def locator_executions(
+    page_model_id: int | None = Query(default=None),
+    window: int = Query(default=50, ge=1, le=500),
+) -> dict[str, object]:
+    """定位策略执行记录数据集（按页面模型 / 最近窗口过滤）。"""
+    return locator_workbench.executions(page_model_id=page_model_id, window=window)
+
+
+@app.post("/api/locator-workbench/retry")
+def locator_workbench_retry(payload: dict | None = None) -> dict[str, object]:
+    """重试仍失效的元素：结构未变只重试候选路径，变化后批量重解析。"""
+    body = payload or {}
+    policy = str(body.get("policy") or "force_rebuild")
+    page_model_id = _as_int(body.get("page_model_id"))
+    result = locator_workbench.retry(page_model_id=page_model_id, policy=policy)
+    return {"ok": True, **result}
+
+
+@app.post("/api/locator-workbench/pipeline")
+def locator_workbench_pipeline(payload: dict | None = None) -> dict[str, object]:
+    """发布定位策略并执行一轮元素定位（首胜提交）。"""
+    body = payload or {}
+    policy = str(body.get("policy") or "force_rebuild")
+    result = locator_workbench.run(policy=policy)
+    return {"ok": True, **result}
+
+
+@app.post("/api/locator-workbench/simulate-refresh")
+def locator_workbench_simulate_refresh(payload: dict | None = None) -> dict[str, object]:
+    """模拟动态页面刷新：页面结构版本变化，触发指纹失效与批量重解析。"""
+    body = payload or {}
+    page_model_id = _as_int(body.get("page_model_id"))
+    if page_model_id is None:
+        return {"ok": False, "message": "缺少 page_model_id"}
+    return locator_workbench.simulate_page_refresh(page_model_id)
+
+
+def _as_int(value: object) -> int | None:
+    if value in (None, "", "page_model"):
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 # ---- 跨模块数据流编排入口 ----
 
 @app.post("/api/pipeline/rpa-lifecycle")
@@ -222,9 +316,10 @@ def pipeline_crawl_schedule() -> dict[str, object]:
 
 
 @app.post("/api/pipeline/element-execution")
-def pipeline_element_execution() -> dict[str, object]:
+def pipeline_element_execution(payload: dict | None = None) -> dict[str, object]:
     """触发元素定位与自动化执行流程。"""
-    result = runtime_session.consume_strategies_and_execute()
+    policy = str((payload or {}).get("policy") or "force_rebuild")
+    result = runtime_session.consume_strategies_and_execute(policy=policy)
     return {"ok": True, "result": result}
 
 

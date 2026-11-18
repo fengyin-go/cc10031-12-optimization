@@ -289,6 +289,8 @@ class RecoveryEntry:
     attempt: int = 0
     max_attempts: int = 3
     resolved: bool = False
+    # 页面结构指纹：失败恢复只在同一结构下复用，结构变化后旧命中不可沿用。
+    fingerprint: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -313,28 +315,45 @@ class FailureRecovery:
             return len(self._entries)
 
     def log(self, module: str, batch_ref: str, step: str,
-            error_detail: str, max_attempts: int = 3) -> RecoveryEntry:
+            error_detail: str, max_attempts: int = 3,
+            fingerprint: str | None = None) -> RecoveryEntry:
         with self._lock:
             self._seq += 1
             entry = RecoveryEntry(
                 recovery_id=self._seq, module=module,
                 batch_ref=batch_ref, step=step,
                 error_detail=error_detail, max_attempts=max_attempts,
+                fingerprint=fingerprint,
             )
             self._entries.append(entry)
             return entry
 
-    def retry(self, recovery_id: int) -> tuple[bool, str]:
+    def retry(self, recovery_id: int,
+              fingerprint: str | None = None) -> tuple[bool, str]:
         with self._lock:
             for e in self._entries:
                 if e.recovery_id == recovery_id:
                     if e.resolved:
                         return False, "已恢复，无需重试"
+                    if (fingerprint is not None and e.fingerprint is not None
+                            and fingerprint != e.fingerprint):
+                        return False, "页面结构已变化，旧命中不可沿用，需重新解析"
                     e.attempt += 1
                     if e.attempt > e.max_attempts:
                         return False, f"已达最大重试次数 {e.max_attempts}"
                     return True, f"重试 {e.attempt}/{e.max_attempts}"
             return False, "恢复记录不存在"
+
+    def pending_for_batch(self, batch_ref: str) -> list[dict[str, Any]]:
+        """同一批次下仍未恢复的记录（供增量重试只处理失效元素）。"""
+        with self._lock:
+            return [{
+                "recovery_id": e.recovery_id, "module": e.module,
+                "batch_ref": e.batch_ref, "step": e.step,
+                "error_detail": e.error_detail, "attempt": e.attempt,
+                "fingerprint": e.fingerprint,
+            } for e in self._entries
+                if e.batch_ref == batch_ref and not e.resolved]
 
     def resolve(self, recovery_id: int) -> bool:
         with self._lock:

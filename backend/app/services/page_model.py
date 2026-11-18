@@ -8,10 +8,14 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.locator_cache import (
+    locator_cache,
+    parse_selector_boundaries,
+    summarize_page_model,
+)
 from app.store import store
 
 
@@ -89,6 +93,42 @@ class PageModelService(BaseModuleService):
             if keyword in structure:
                 return fields
         return ["数据项1", "数据项2", "数据项3"]  # 默认字段
+
+    def page_structure_summary(self, model_id: int) -> dict[str, Any] | None:
+        """读取页面结构摘要并同步缓存指纹状态。
+
+        结构指纹变化时，该模型下所有失效选择器缓存立即作废，
+        返回结果里的 ``structure_changed`` 供运行时决定是否批量重解析。
+        """
+        entry = store.find(self.MODULE, model_id)
+        if entry is None:
+            return None
+        observed = locator_cache.observe(entry)
+        return {
+            **observed,
+            "boundaries": parse_selector_boundaries(
+                entry.get("页面结构", ""), entry.get("动态元素", "")),
+        }
+
+    def fingerprint_of(self, model_id: int) -> str | None:
+        entry = store.find(self.MODULE, model_id)
+        if entry is None:
+            return None
+        return summarize_page_model(entry)["fingerprint"]
+
+    def list_structure_fingerprints(self) -> list[dict[str, Any]]:
+        """列出全部页面模型的结构指纹，供定位工作台核对。"""
+        return [
+            {
+                "model_id": model.get("id"),
+                "model_name": model.get("模型名称"),
+                "target_site": model.get("目标站点"),
+                "fingerprint": summarize_page_model(model)["fingerprint"],
+                "status": model.get("status"),
+                "cache_state": locator_cache.state_for(model.get("id")),
+            }
+            for model in store.rows(self.MODULE)
+        ]
 
     def list_active_models(self) -> list[dict[str, Any]]:
         """查询所有已使用状态的页面模型。"""

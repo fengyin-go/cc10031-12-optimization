@@ -11,6 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/views/LocatorWorkbenchView.vue 定位工作台（缓存指纹/失效策略/执行记录）
 │   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
@@ -18,10 +19,40 @@
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
+│   ├── app/services/locator_cache.py    定位缓存/结构指纹/执行台账
+│   ├── app/services/locator_workbench.py 定位工作台聚合（处理项/窗口重算）
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
 ```
+
+## 元素定位恢复链路
+
+动态页面会反复探测已失效的定位策略，定位链路按下面的规则收敛：
+
+- 失效选择器与**页面结构指纹**一起缓存，指纹变化后缓存立即失效，
+  失败恢复不会沿用旧命中。指纹由 `app/services/locator_cache.py`
+  的 `summarize_page_model` 统一计算，`element_selector` / `page_model` /
+  `runtime_session` 共用同一套判定，不再各写一遍。
+- 结构未变时命中缓存，探测次数为 0；缓存失效时每个元素最多探测
+  主策略 + 回退两条候选路径，重试只处理仍失效的元素，不会重复扫描整组选择器。
+- 结构变化且旧回退仍能命中时，可选 `force_rebuild`（强制重建全部定位）
+  或 `probe_then_decide`（先探测再决定重建）；两种策略都不会把旧命中
+  发布成新记录，统一落到 **12 号处理终态**「结构冲突待重建」。
+- 并发执行由首胜闸门控制，只接受首个成功结果，落败记录标记 9 号终态。
+- 未绑定页面模型的旧版策略按合成摘要执行，保持既有版本边界可用。
+
+定位工作台页面：前端 `/locator-workbench`，接口如下：
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/locator-workbench` | 按页面模型查看缓存指纹、失效策略、可重试边界与最近执行记录 |
+| `GET /api/locator-workbench/window?page_model_id=&window=` | 重算窗口内定位策略执行历史，解析可复用选择器边界 |
+| `POST /api/locator-workbench/retry` | 重试仍失效的元素（`policy` 二选一） |
+| `POST /api/locator-workbench/work-item` | 接收处理项并展开定位策略执行记录数据集 |
+| `POST /api/locator-workbench/pipeline` | 发布策略并执行一轮定位（首胜提交） |
+| `POST /api/locator-workbench/simulate-refresh` | 模拟动态页面刷新，触发指纹失效 |
+| `GET /api/locator-executions` | 定位策略执行记录数据集（按窗口过滤） |
 
 ## 启动
 

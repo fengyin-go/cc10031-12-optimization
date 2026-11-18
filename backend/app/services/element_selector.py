@@ -12,6 +12,12 @@ from enum import Enum
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.locator_cache import (
+    locator_cache,
+    parse_selector_boundaries,
+    summarize_page_model,
+    summarize_strategy,
+)
 from app.store import store
 
 
@@ -39,7 +45,9 @@ class ElementSelectorService(BaseModuleService):
         """发布定位规则作为结构化策略，供 runtime_session 消费。
 
         将定位规则（选择器类型、表达式、匹配策略、回退方案）封装为
-        结构化策略写入 channel。
+        结构化策略写入 channel。策略同时携带页面结构指纹与可复用选择器边界：
+        运行时据此判断结构是否变化、哪些候选路径仍有效，
+        结构未变时不再重新扫描整组选择器。
 
         Returns:
             发布结果概要或 None
@@ -55,16 +63,7 @@ class ElementSelectorService(BaseModuleService):
         entry["status"] = "已启用"
         entry["pending"] = True
 
-        strategy = {
-            "rule_id": rule_id,
-            "rule_name": entry.get("规则名称"),
-            "selector_type": entry.get("选择器类型", "css"),
-            "expression": entry.get("定位表达式", ""),
-            "match_strategy": entry.get("匹配策略", "first_match"),
-            "wait_condition": entry.get("等待条件", "visible"),
-            "fallback": entry.get("回退方案", ""),
-            "bot_ref": entry.get("所属流程", ""),
-        }
+        strategy = self.build_locator_strategy(entry)
 
         msg = store.channel.publish(
             topic="rpa.locator_strategies",
@@ -76,7 +75,71 @@ class ElementSelectorService(BaseModuleService):
             "status": "已启用",
             "msg_id": msg.msg_id,
             "selector_type": strategy["selector_type"],
+            "page_model_id": strategy["page_model_id"],
+            "page_fingerprint": strategy["page_fingerprint"],
+            "boundary_count": len(strategy["boundaries"]),
         }
+
+    def build_locator_strategy(self, rule: dict[str, Any]) -> dict[str, Any]:
+        """构造定位策略载荷：规则字段 + 页面结构摘要 + 选择器边界。
+
+        关联页面模型时以模型的结构指纹为准；未关联时退化为合成摘要，
+        保证旧版规则（没有页面模型引用）仍然可以发布和执行。
+        """
+        model_id = self.resolve_page_model_id(rule)
+        model = store.find("page_model", model_id) if model_id is not None else None
+        if model is not None:
+            summary = summarize_page_model(model)
+            # 有关联页面模型时，可复用边界只取自页面结构，
+            # 不能把规则自己的表达式混进来，否则任何选择器都会“命中”自己。
+            boundaries = parse_selector_boundaries(
+                summary["structure"], summary["dynamic_elements"])
+        else:
+            summary = summarize_strategy({
+                "expression": rule.get("定位表达式", ""),
+                "fallback": rule.get("回退方案", ""),
+                "selector_type": rule.get("选择器类型", "css"),
+                "bot_ref": rule.get("所属流程", ""),
+            })
+            # 旧版规则没有页面模型上下文，只能以策略自身作为兼容边界。
+            boundaries = parse_selector_boundaries(
+                rule.get("定位表达式", ""), rule.get("回退方案", ""))
+        return {
+            "rule_id": rule.get("id"),
+            "rule_name": rule.get("规则名称"),
+            "selector_type": rule.get("选择器类型", "css"),
+            "expression": rule.get("定位表达式", ""),
+            "match_strategy": rule.get("匹配策略", "first_match"),
+            "wait_condition": rule.get("等待条件", "visible"),
+            "fallback": rule.get("回退方案", ""),
+            "bot_ref": rule.get("所属流程", ""),
+            "page_model_id": summary["model_id"],
+            "page_model_name": summary["model_name"],
+            "page_fingerprint": summary["fingerprint"],
+            "page_summary": summary["summary"],
+            "boundaries": boundaries,
+            "boundary_count": len(boundaries),
+            "structure_changed": bool(
+                locator_cache.state_for(summary["model_id"]).get("structure_changed")
+            ),
+        }
+
+    def resolve_page_model_id(self, rule: dict[str, Any]) -> int | None:
+        """确定规则所属页面模型：优先显式引用，其次按“所属流程”匹配模型名。"""
+        explicit = rule.get("page_model_id")
+        if explicit not in (None, ""):
+            try:
+                return int(explicit)
+            except (TypeError, ValueError):
+                pass
+        bot_ref = str(rule.get("所属流程", "")).strip()
+        if not bot_ref:
+            return None
+        for model in store.rows("page_model"):
+            name = str(model.get("模型名称", ""))
+            if name and (bot_ref in name or name in bot_ref):
+                return int(model.get("id"))
+        return None
 
     def resolve_element(self, element_spec: str,
                          page_context: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -1,6 +1,11 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
 import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  RetryResult,
+  WindowRecompute,
+  WorkbenchSnapshot,
+} from '@/data/locator-types'
 
 export { moduleMeta }
 
@@ -104,5 +109,42 @@ export async function triggerPipeline(lifecycle: string): Promise<Record<string,
 export async function loadRecoveryStats(): Promise<Record<string, unknown>> {
   const response = await request('/api/recovery')
   if (!response.ok) throw new Error('恢复状态查询失败')
+  return await response.json()
+}
+
+// ---- 定位工作台 ----
+
+/** 定位工作台：按页面模型查看缓存指纹、失效策略与最近执行记录 */
+export async function loadLocatorWorkbench(
+  pageModelId?: number,
+): Promise<WorkbenchSnapshot> {
+  const query = pageModelId ? `?page_model_id=${pageModelId}` : ''
+  const response = await request(`/api/locator-workbench${query}`)
+  if (!response.ok) throw new Error('定位工作台读取失败')
+  return await response.json()
+}
+
+/** 重算窗口内定位策略执行历史，解析当前可复用选择器边界 */
+export async function loadLocatorWindow(
+  pageModelId: number,
+  window = 50,
+): Promise<WindowRecompute> {
+  const response = await request(
+    `/api/locator-workbench/window?page_model_id=${pageModelId}&window=${window}`,
+  )
+  if (!response.ok) throw new Error('定位窗口重算失败')
+  return await response.json()
+}
+
+/** 重试仍失效的元素：结构未变只走候选路径，结构变化后批量重解析 */
+export async function retryInvalidLocators(
+  pageModelId: number | undefined,
+  policy: string,
+): Promise<RetryResult> {
+  const response = await request('/api/locator-workbench/retry', {
+    method: 'POST',
+    body: JSON.stringify({ page_model_id: pageModelId, policy }),
+  })
+  if (!response.ok) throw new Error('失效元素重试失败')
   return await response.json()
 }
